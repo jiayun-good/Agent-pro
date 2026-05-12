@@ -1,4 +1,4 @@
 # 都是本地模型
 
-chat_model_name: qwen:7b
+chat_model_name: qwen2.5:7b
 embedding_model_name: nomic-embed-text:latest

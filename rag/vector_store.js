@@ -1,93 +1,142 @@
-
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
-import pdfParse from 'pdf-parse';
+import { chromaConf as chromaConfig } from '../utils/configHandler.js';
 import { OllamaEmbeddings } from '@langchain/ollama';
 import { Chroma } from "@langchain/community/vectorstores/chroma";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { getFileMD5, loadMD5Store, saveMD5ToStore, pdfLoader } from '../utils/md5Utils.js';
+import { getAbsPath } from '../utils/pathTool.js';
+import { createChatModel, createEmbeddingModel } from '../model/modelFactory.js'; // 使用新的函数式API
 
-// --------------------
-// 生成文件 md5
-// --------------------
-export function getFileMd5Hex(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  return crypto.createHash('md5').update(buffer).digest('hex');
-}
+/**
+ * 将 PDF 文档处理成向量存储
+ * @param {string} dirPath - PDF 文件所在目录
+ * @param {Chroma} vectorStore - LangChain Chroma 向量库实例
+ * @param {boolean} force - 是否强制重新入库（忽略 MD5）
+ */
+export async function processDocumentsToVectorStore(dirPath, vectorStore, force = false) {
+  const md5StorePath = getAbsPath(path.join(dirPath, chromaConfig.md5_hex_store));
+  const md5Set = loadMD5Store(md5StorePath); // 加载已入库的文件 MD5
 
-// --------------------
-// 遍历文件夹并筛选指定类型
-// --------------------
-export function listFilesWithAllowedTypes(dirPath, allowedTypes = ['.pdf']) {
-  if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) {
-    throw new Error(`${dirPath} 不是有效目录`);
-  }
+  const files = fs.readdirSync(getAbsPath(dirPath))
+    .filter(f => chromaConfig.allow_knowledge_file_type.includes(f.split('.').pop()))
+    .map(f => getAbsPath(path.join(dirPath, f)));
 
-  const files = fs.readdirSync(dirPath)
-    .filter(f => allowedTypes.includes(path.extname(f).toLowerCase()))
-    .map(f => path.join(dirPath, f));
-
-  return files;
-}
-
-// --------------------
-// 解析 PDF
-// --------------------
-export async function pdfLoader(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const data = await pdfParse(buffer);
-  return data.text; // 返回 PDF 文本
-}
-
-// --------------------
-// 构建向量并存入 VectorStore
-// --------------------
-export async function processDocumentsToVectorStore(dirPath, embeddingModel, vectorStore) {
-  const files = listFilesWithAllowedTypes(dirPath, ['.pdf']);
+  // 分片器
+  const textSplitter = new RecursiveCharacterTextSplitter({
+    chunkSize: chromaConfig.chunk_size,
+    chunkOverlap: chromaConfig.chunk_overlap,
+    separators: chromaConfig.separators,
+  });
 
   for (const file of files) {
-    const md5 = getFileMd5Hex(file);
-
-    // 检查 vectorStore 是否已有此 md5
-    const existing = await vectorStore.similaritySearchById(md5);
-    if (existing.length > 0) {
-      console.log(`文件已存在，跳过: ${file}`);
+    const fileName = path.basename(file);
+    const fileMD5 = getFileMD5(file);
+  
+    if (!force && md5Set.has(fileMD5)) {
+      console.log(`⏩ 跳过文件: ${fileName} (内容已存在, MD5: ${fileMD5})`);
       continue;
     }
-
-    // 解析 PDF
-    const text = await pdfLoader(file);
-
-    // 生成向量
-    const vector = await embeddingModel.embedQuery(text);
-
-    // 存入 vector store
-    await vectorStore.add({
-      id: md5,
-      vector,
-      metadata: { filePath: file, text }
-    });
-
-    console.log(`已处理文件: ${file}`);
+  
+    try {
+      let docs;
+  
+      if (file.endsWith('.pdf')) {
+        // PDF 文件
+        docs = await pdfLoader(file); // [{ pageContent, metadata }, ...]
+      } else if (file.endsWith('.txt')) {
+        // TXT 文件
+        const content = fs.readFileSync(file, 'utf-8');
+        docs = [{ pageContent: content, metadata: { source: fileName, filePath: file } }];
+      } else {
+        console.log(`⚠️ 忽略不支持的文件类型: ${fileName}`);
+        continue;
+      }
+  
+      // 分片
+      let chunkedDocs = [];
+      for (const doc of docs) {
+        const chunks = await textSplitter.splitText(doc.pageContent);
+        chunks.forEach((chunk, idx) => {
+          chunkedDocs.push({
+            pageContent: chunk,
+            metadata: {
+              ...doc.metadata,
+              chunkIndex: idx,
+              md5: fileMD5
+            }
+          });
+        });
+      }
+  
+      // 入库
+      await vectorStore.addDocuments(chunkedDocs);
+      console.log(`✅ 已完成入库: ${fileName} (MD5: ${fileMD5})`);
+  
+      // 更新 MD5
+      saveMD5ToStore(md5StorePath, fileMD5);
+      md5Set.add(fileMD5);
+  
+    } catch (error) {
+      console.error(`❌ 处理文件出错: ${fileName} | 原因: ${error.message}`);
+    }
   }
 }
 
-// --------------------
-// 使用示例
-// --------------------
-async function main() {
-  const embeddingModel = new OllamaEmbeddings({
-    model: 'nomic-embed-text:latest',
-    baseUrl: 'http://localhost:11434',
+/**
+ * 获取向量检索器
+ * @param {OllamaEmbeddings} embeddingModel - 嵌入模型实例
+ * @param {string} collectionName - 集合名称
+ * @param {string} host - Chroma 主机地址
+ * @param {number} port - Chroma 端口
+ * @returns {Object} 检索器实例
+ */
+export function getRetriever(embeddingModel, collectionName, host = 'localhost', port = 8000) {
+  const vectorStore = new Chroma(embeddingModel, {
+    collectionName: collectionName,
+    host: host,
+    port: port,
   });
 
-  // 这里用 Chroma 做示例，你也可以换成自己的 vector_store
-  const vectorStore = new Chroma({
-    collectionName: 'test_docs',
-    url: 'http://localhost:8000', // Docker Chroma 服务地址
-    embeddingFunction: embeddingModel, // OllamaEmbeddings 对象
-  });
-
-  await processDocumentsToVectorStore('./docs', embeddingModel, vectorStore);
+  return vectorStore.asRetriever();
 }
 
-main().catch(console.error);
+/**
+ * 获取完整的 RAG 系统（包含模型和检索器）- 异步版本
+ * @returns {Promise<Object>} 包含 chatModel 和 retriever 的对象
+ */
+export async function getRagSystem() {
+  // 直接使用函数创建模型实例
+  const chatModel = createChatModel();
+  const embedModel = createEmbeddingModel();
+
+  // 获取检索器
+  const retriever = getRetriever(
+    embedModel,
+    chromaConfig.collection_name,
+    chromaConfig.host,
+    chromaConfig.port
+  );
+
+  return {
+    chatModel,
+    retriever,
+    embedModel
+  };
+}
+
+/**
+ * 获取向量存储实例（用于添加文档）
+ * @returns {Promise<Chroma>} Chroma 向量存储实例
+ */
+export async function getVectorStore() {
+  const embedModel = createEmbeddingModel();
+  
+  const vectorStore = new Chroma(embedModel, {
+    collectionName: chromaConfig.collection_name,
+    host: chromaConfig.host,
+    port: chromaConfig.port,
+  });
+  
+  return vectorStore;
+}
